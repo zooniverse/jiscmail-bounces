@@ -3,9 +3,13 @@
 import cymysql
 import email
 import imaplib
+import re
 import yaml
 
 from pyquery import PyQuery as pq
+
+SUBJECT_REGEX = (r"^ZOONIVERSE2?: (Daily error monitoring report|.* left the "
+                 "list)$")
 
 with open('/email.yml') as email_yml:
     email_credentials = yaml.load(email_yml)
@@ -19,14 +23,15 @@ M.select()
 reject_emails = set()
 warnings = set()
 
-typ, data = M.search(None, '(FROM "JISCMAIL")',
-                     '(SUBJECT "Daily error monitoring report")')
+typ, data = M.search(None, '(FROM "JISCMAIL")')
+
 for num in data[0].split():
     typ, data = M.fetch(num, '(RFC822)')
     message = email.message_from_string(data[0][1])
-    print 'Processing "%s" from %s' % (message['Subject'], message['Date'])
-    if (message['subject'] == "ZOONIVERSE2: Daily error monitoring report"
-        or message['subject'] == "ZOONIVERSE: Daily error monitoring report"):
+
+
+    if re.match(SUBJECT_REGEX, message['subject']):
+        print 'Processing "%s" from %s' % (message['Subject'], message['Date'])
         for part in message.walk():
             if(part.get_content_type()=="text/html"):
                 body = str(part)
@@ -36,7 +41,10 @@ for num in data[0].split():
         try:
             split_index = body.index("currently being monitored")
         except:
-            split_index = len(body)
+            try:
+                split_index = body.index("Original mail header")
+            except:
+                split_index = len(body)
 
         for email_link in mailtos:
             recip = email_link.get("href").split(':')[-1]
@@ -47,9 +55,9 @@ for num in data[0].split():
 
             if email_index < split_index:
                 reject_emails.add(recip)
-            else:
-                warnings.add(recip)
         M.store(num, '+FLAGS', '\\Deleted')
+    else:
+        print 'Ignoring "%s" from %s' % (message['Subject'], message['Date'])
 
 M.close()
 M.logout()
@@ -57,7 +65,7 @@ M.logout()
 if len(reject_emails) == 0:
     exit()
 
-print "Reject emails (%d total):" % len(reject_emails)
+print "Removed emails (%d total):" % len(reject_emails)
 
 for e in reject_emails:
     print "* %s" % e
