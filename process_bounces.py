@@ -1,73 +1,92 @@
 #!/usr/bin/env python
 
-import cymysql
+import datetime
 import email
 import imaplib
+import psycopg2
 import re
+import smtplib
+import sys
+import time
 import yaml
 
-from pyquery import PyQuery as pq
+from email.mime.text import MIMEText
 
-SUBJECT_REGEX = (r"^ZOONIVERSE2?: (Daily error monitoring report|.* left the "
-                 "list)$")
+def generate_changelog_name():
+    d = datetime.datetime.now()
+    offset = d.day % 7
+    if offset == 0:
+        offset = 7
+    d = d - datetime.timedelta(days=offset)
+    week_letter = ['A', 'B', 'C', 'D', 'E'][int((d.day-1)/7)]
+    return "CHANGELOG-%s%s" % (d.strftime("%Y%m"), week_letter)
 
 with open('/email.yml') as email_yml:
     email_credentials = yaml.load(email_yml)
 
-M = imaplib.IMAP4_SSL(email_credentials['host'])
+latest_changelog = generate_changelog_name()
 
-M.login(email_credentials['user'], email_credentials['pass'])
+listserv_address = 'listserv@jiscmail.ac.uk'
+msg = MIMEText("GET ZOONIVERSE.%s" % latest_changelog)
+msg['from'] = email_credentials['user']
+msg['to'] = listserv_address
 
-M.select()
+print "Requesting %s" % latest_changelog
 
-reject_emails = set()
-warnings = set()
+s = smtplib.SMTP_SSL(email_credentials['smtp_host'])
+s.login(email_credentials['user'], email_credentials['pass'])
+s.sendmail(email_credentials['user'], [listserv_address], msg.as_string())
+s.quit()
 
-typ, data = M.search(None, '(FROM "JISCMAIL")')
+expected_subject = "File: ZOONIVERSE %s" % latest_changelog
 
-for num in data[0].split():
-    typ, data = M.fetch(num, '(RFC822)')
-    message = email.message_from_string(data[0][1])
+print "Waiting for changelog to arrive",
 
+while True:
+    try:
+        M = imaplib.IMAP4_SSL(email_credentials['host'])
+        M.login(email_credentials['user'], email_credentials['pass'])
+        M.select()
+        typ, data = M.search(None, '(FROM "%s")' % listserv_address,
+                             '(HEADER Subject "%s")' % expected_subject)
+        if len(data) == 0 or len(data[0]) == 0:
+            print ".",
+            sys.stdout.flush()
+            time.sleep(60)
+            continue
 
-    if re.match(SUBJECT_REGEX, message['subject']):
-        print 'Processing "%s" from %s' % (message['Subject'], message['Date'])
-        for part in message.walk():
-            if(part.get_content_type()=="text/html"):
-                body = str(part)
-        parsed_html = pq(body)
-        mailtos = parsed_html('a[href^=mailto]')
+        num = data[0]
+        typ, data = M.fetch(num, '(RFC822)')
+        message = email.message_from_string(data[0][1])
 
-        try:
-            split_index = body.index("currently being monitored")
-        except:
-            try:
-                split_index = body.index("Original mail header")
-            except:
-                split_index = len(body)
-
-        for email_link in mailtos:
-            recip = email_link.get("href").split(':')[-1]
-            try:
-                email_index = body.index(str(recip))
-            except:
-                reject_emails.add(recip)
-
-            if email_index < split_index:
-                reject_emails.add(recip)
+        changelog = message.as_string()
         M.store(num, '+FLAGS', '\\Deleted')
-    else:
-        print 'Ignoring "%s" from %s' % (message['Subject'], message['Date'])
+        break
+    finally:
+        M.close()
+        M.logout()
+        print ""
 
-M.close()
-M.logout()
+changes = {}
 
-if len(reject_emails) == 0:
-    exit()
+for line in changelog.split('\n'):
+    m = re.match(
+        r'(?P<timestamp>\d{14}) (?P<action>\w+) (?P<email>[^\s]+).*',
+        line
+    )
+    if not m:
+        continue
+    timestamp, action, email = m.groups()
+    changes.setdefault(action, set()).add(email)
 
-print "Removed emails (%d total):" % len(reject_emails)
+removed_addresses = (
+    list(changes.get('AUTODEL', [])) + list(changes.get('SIGNOFF', []))
+)
+removed_addresses = map(lambda s: s.lower(), removed_addresses)
 
-for e in reject_emails:
+print "Unsubscribing: "
+
+for e in removed_addresses:
     print "* %s" % e
 
 with open('/database.yml') as db_yaml:
@@ -75,16 +94,20 @@ with open('/database.yml') as db_yaml:
 
 prod = db_credentials['production']
 
-conn = cymysql.connect(host=prod['host'], user=prod['username'],
-                       passwd=prod['password'], db=prod['database'])
-cur = conn.cursor()
+conn = psycopg2.connect(
+    host=prod['host'], user=prod['username'], password=prod['password'],
+    dbname=prod['database']
+)
 
-cur.execute("UPDATE users SET valid_email = 0 WHERE email IN (%s) LIMIT %d" %
-            (",".join([ conn.escape(e) for e in reject_emails]),
-             len(reject_emails))
-           )
-
-print "Updated %d matching rows." % cur.rowcount
-
-cur.close()
-conn.close()
+try:
+    cur = conn.cursor()
+    cur.execute(
+        ("UPDATE users SET global_email_communication = FALSE "
+         "WHERE LOWER(email) = ANY(%s)"),
+        (removed_addresses,)
+    )
+    conn.commit()
+    print "Updated %d matching rows." % cur.rowcount
+finally:
+    cur.close()
+    conn.close()
