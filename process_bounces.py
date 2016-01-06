@@ -12,7 +12,7 @@ import yaml
 
 from email.mime.text import MIMEText
 
-CHANGELOG_TIMELIMIT = datetime.timedelta(mins=30)
+CHANGELOG_TIMELIMIT = datetime.timedelta(minutes=30)
 
 def generate_changelog_name():
     d = datetime.datetime.now()
