@@ -12,6 +12,8 @@ import yaml
 
 from email.mime.text import MIMEText
 
+CHANGELOG_TIMELIMIT = datetime.timedelta(mins=30)
+
 def generate_changelog_name():
     d = datetime.datetime.now()
     offset = d.day % 7
@@ -42,7 +44,13 @@ expected_subject = "File: ZOONIVERSE %s" % latest_changelog
 
 print "Waiting for changelog to arrive",
 
+changelog_cutoff = datetime.datetime.now() + CHANGELOG_TIMELIMIT
+
 while True:
+    if datetime.datetime.now() > changelog_cutoff:
+        print "\nChangelog didn't arrive in time. Giving up."
+        sys.exit(1)
+
     try:
         M = imaplib.IMAP4_SSL(email_credentials['host'])
         M.login(email_credentials['user'], email_credentials['pass'])
